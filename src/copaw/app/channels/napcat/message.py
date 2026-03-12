@@ -17,7 +17,9 @@ from ..base import OutgoingContentPart
 from .constants import MARKDOWN_PATTERNS
 
 
-def parse_message(message: Any) -> List[OutgoingContentPart]:
+def parse_message(  # pylint: disable=R0912
+    message: Any,
+) -> List[OutgoingContentPart]:
     """Parse OneBot 11 message to content parts.
 
     Handles:
@@ -98,7 +100,10 @@ def parse_message(message: Any) -> List[OutgoingContentPart]:
     return parts
 
 
-def build_message_segment(text: str, auto_escape: bool = True) -> Any:
+def build_message_segment(  # pylint: disable=R0912
+    text: str,
+    auto_escape: bool = True,
+) -> Any:
     """Build OneBot 11 message segment from text.
 
     Args:
@@ -111,6 +116,7 @@ def build_message_segment(text: str, auto_escape: bool = True) -> Any:
     if auto_escape:
         # Simple escape for CQ codes
         text = text.replace("&", "&amp;")
+        text = text.replace(",", "&#44;")
         text = text.replace("[", "&#91;")
         text = text.replace("]", "&#93;")
     return text

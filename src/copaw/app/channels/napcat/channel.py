@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from agentscope_runtime.engine.schemas.agent_schemas import (
-    RunStatus,
     TextContent,
     ContentType,
 )
@@ -23,7 +22,6 @@ from agentscope_runtime.engine.schemas.agent_schemas import (
 from ..base import (
     BaseChannel,
     OnReplySent,
-    OutgoingContentPart,
     ProcessHandler,
 )
 from .constants import DEFAULT_MEDIA_DIR
@@ -111,33 +109,25 @@ class NapCatChannel(BaseChannel):
         filter_thinking: bool = False,
     ) -> "NapCatChannel":
         """Create channel from config dict or NapCatConfig model."""
-        # Handle both dict and Pydantic model
-        if hasattr(config, "get"):
-            # It's a dict
-            enabled = config.get("enabled", False)
-            host = config.get("host", "127.0.0.1")
-            port = config.get("port", 3000)
-            ws_port = config.get("ws_port", 3001)
-            access_token = config.get("access_token", "")
-            bot_prefix = config.get("bot_prefix", "")
-            dm_policy = config.get("dm_policy", "open")
-            group_policy = config.get("group_policy", "open")
-            allow_from = config.get("allow_from", [])
-            deny_message = config.get("deny_message", "")
-            media_dir = config.get("media_dir", "")
-        else:
-            # It's a Pydantic model
-            enabled = getattr(config, "enabled", False)
-            host = getattr(config, "host", "127.0.0.1")
-            port = getattr(config, "port", 3000)
-            ws_port = getattr(config, "ws_port", 3001)
-            access_token = getattr(config, "access_token", "")
-            bot_prefix = getattr(config, "bot_prefix", "")
-            dm_policy = getattr(config, "dm_policy", "open")
-            group_policy = getattr(config, "group_policy", "open")
-            allow_from = getattr(config, "allow_from", [])
-            deny_message = getattr(config, "deny_message", "")
-            media_dir = getattr(config, "media_dir", "")
+
+        def get_config_attr(config_obj: Any, attr: str, default: Any) -> Any:
+            """Get attribute from dict or Pydantic model."""
+            if hasattr(config_obj, "get"):
+                return config_obj.get(attr, default)
+            return getattr(config_obj, attr, default)
+
+        # Read config values using helper
+        enabled = get_config_attr(config, "enabled", False)
+        host = get_config_attr(config, "host", "127.0.0.1")
+        port = get_config_attr(config, "port", 3000)
+        ws_port = get_config_attr(config, "ws_port", 3001)
+        access_token = get_config_attr(config, "access_token", "")
+        bot_prefix = get_config_attr(config, "bot_prefix", "")
+        dm_policy = get_config_attr(config, "dm_policy", "open")
+        group_policy = get_config_attr(config, "group_policy", "open")
+        allow_from = get_config_attr(config, "allow_from", [])
+        deny_message = get_config_attr(config, "deny_message", "")
+        media_dir = get_config_attr(config, "media_dir", "")
 
         return cls(
             process=process,
@@ -446,120 +436,58 @@ class NapCatChannel(BaseChannel):
             channel_meta=meta,
         )
 
-    async def consume_one(self, payload: Any) -> None:  # noqa: R0912,R0915
-        """Process one AgentRequest from queue."""
-        request = payload
-        if getattr(request, "input", None):
+    def get_to_handle_from_request(self, request: Any) -> str:
+        """Resolve send target (to_handle) from AgentRequest.
+
+        For group messages, use group_id; otherwise use user_id.
+        """
+        send_meta = getattr(request, "channel_meta", None) or {}
+        group_id = send_meta.get("group_id")
+        message_type = send_meta.get("message_type")
+
+        # Try to get group_id from session_id if not present
+        if not group_id and message_type == "group":
             session_id = getattr(request, "session_id", "") or ""
-            contents = list(
-                getattr(request.input[0], "content", None) or [],
-            )
-            should_process, merged = self._apply_no_text_debounce(
-                session_id,
-                contents,
-            )
-            if not should_process:
-                return
-            if merged:
-                if hasattr(request.input[0], "model_copy"):
-                    request.input[0] = request.input[0].model_copy(
-                        update={"content": merged},
-                    )
-                else:
-                    request.input[0].content = merged
+            if session_id.startswith("napcat:group:"):
+                group_id = session_id.split(":")[-1]
 
-        try:
-            send_meta = getattr(request, "channel_meta", None) or {}
-            send_meta.setdefault("bot_prefix", self.bot_prefix)
-            # Add session_id to send_meta so send method can access it
-            send_meta["session_id"] = getattr(request, "session_id", "")
+        if group_id:
+            return group_id
+        return getattr(request, "user_id", "") or ""
 
-            # For group messages, use group_id; otherwise use user_id
-            group_id = send_meta.get("group_id")
-            message_type = send_meta.get("message_type")
+    async def _before_consume_process(
+        self,
+        request: Any,
+    ) -> None:
+        """Set up send_meta before processing request."""
+        # Get or create channel_meta
+        send_meta = getattr(request, "channel_meta", None)
+        if send_meta is None:
+            send_meta = {}
+            setattr(request, "channel_meta", send_meta)
 
-            # Try to get group_id from session_id if not present
-            if not group_id and message_type == "group":
-                session_id = getattr(request, "session_id", "") or ""
-                if session_id.startswith("napcat:group:"):
-                    group_id = session_id.split(":")[-1]
-            if group_id:
-                to_handle = group_id
-            else:
-                to_handle = request.user_id or ""
-            last_response = None
-            accumulated_parts: List[OutgoingContentPart] = []
-            event_count = 0
+        # Add bot_prefix to send_meta
+        send_meta.setdefault("bot_prefix", self.bot_prefix)
 
-            async for event in self._process(request):
-                event_count += 1
-                obj = getattr(event, "object", None)
-                status = getattr(event, "status", None)
-                ev_type = getattr(event, "type", None)
-                logger.debug(
-                    "napcat event #%s: object=%s status=%s type=%s",
-                    event_count,
-                    obj,
-                    status,
-                    ev_type,
-                )
-                if obj == "message" and status == RunStatus.Completed:
-                    parts = self._message_to_content_parts(event)
-                    logger.info(
-                        "napcat completed message: type=%s parts_count=%s",
-                        ev_type,
-                        len(parts),
-                    )
-                    accumulated_parts.extend(parts)
-                elif obj == "response":
-                    last_response = event
+        # Add session_id to send_meta so send method can access it
+        send_meta["session_id"] = getattr(request, "session_id", "")
 
-            err_msg = self._get_response_error_message(last_response)
-            if err_msg:
-                err_text = self.bot_prefix + f"Error: {err_msg}"
-                await self.send_content_parts(
-                    to_handle,
-                    [TextContent(type=ContentType.TEXT, text=err_text)],
-                    send_meta,
-                )
-            elif accumulated_parts:
-                await self.send_content_parts(
-                    to_handle,
-                    accumulated_parts,
-                    send_meta,
-                )
-            elif last_response is None:
-                err_text = (
-                    self.bot_prefix + "An error occurred while processing."
-                )
-                await self.send_content_parts(
-                    to_handle,
-                    [TextContent(type=ContentType.TEXT, text=err_text)],
-                    send_meta,
-                )
-            if self._on_reply_sent:
-                self._on_reply_sent(
-                    self.channel,
-                    to_handle,
-                    request.session_id or f"{self.channel}:{to_handle}",
-                )
-        except Exception as e:
-            logger.exception("napcat process/reply failed")
-            err_msg = str(e).strip() or "An error occurred while processing."
-            try:
-                fallback_handle = getattr(request, "user_id", "")
-                await self.send_content_parts(
-                    fallback_handle,
-                    [
-                        TextContent(
-                            type=ContentType.TEXT,
-                            text=f"Error: {err_msg}",
-                        ),
-                    ],
-                    getattr(request, "channel_meta", None) or {},
-                )
-            except Exception:
-                logger.exception("send error message failed")
+    async def _on_consume_error(
+        self,
+        request: Any,
+        to_handle: str,
+        err_text: str,
+    ) -> None:
+        """Handle error with bot_prefix prefix."""
+        # Add bot_prefix to error message
+        prefixed_err_text = self.bot_prefix + err_text
+
+        send_meta = getattr(request, "channel_meta", None) or {}
+        await self.send_content_parts(
+            to_handle,
+            [TextContent(type=ContentType.TEXT, text=prefixed_err_text)],
+            send_meta,
+        )
 
     def _handle_event(self, payload: Dict[str, Any]) -> None:
         """Handle incoming NapCat/OneBot 11 event."""
